@@ -694,6 +694,11 @@ def approve_action(action_id, reviewed_fingerprint):
             subject,
             body,
             token_file=get_integration_setting("GMAIL_TOKEN_FILE", "token.json"),
+            oauth_client_id=get_integration_setting("GMAIL_OAUTH_CLIENT_ID"),
+            oauth_client_secret=get_integration_setting(
+                "GMAIL_OAUTH_CLIENT_SECRET"
+            ),
+            refresh_token=get_integration_setting("GMAIL_REFRESH_TOKEN"),
         ),
         create_trello_card=lambda title, description, due_date: create_trello_card(
             title,

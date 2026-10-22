@@ -105,7 +105,8 @@ Local-only configuration, OAuth files, databases, and virtual environments are i
 - Python and pip, using a Python version supported by the dependencies in `requirements.txt`.
 - Windows PowerShell for the commands below.
 - A Groq API key to submit requests to the LLM.
-- For Gmail sends: a Google Cloud project with Gmail API enabled and a Desktop OAuth client.
+- For local Gmail sends: a Google Cloud project with Gmail API enabled and a Desktop OAuth client.
+- For hosted Gmail sends: a Google Cloud **Web application** OAuth client and an authorized refresh token.
 - For Trello card creation: a Trello API key, an authorized token, and a target list ID.
 
 Gmail, Trello, and website-check configuration is only needed for the integrations you intend to exercise. The automated tests use mocks and do not need live service credentials.
@@ -134,6 +135,9 @@ The application loads `.env` from the project root. The app can also read its Gr
 | `GROQ_API_KEY` | Required to submit intake requests to Groq. |
 | `GMAIL_CREDENTIALS_FILE` | Path to the local Google OAuth client JSON; defaults to `credentials.json`. Used by the local Gmail authorization command. |
 | `GMAIL_TOKEN_FILE` | Path where Gmail OAuth authorization is saved and loaded; defaults to `token.json`. |
+| `GMAIL_OAUTH_CLIENT_ID` | Web application OAuth client ID for hosted Gmail sending. |
+| `GMAIL_OAUTH_CLIENT_SECRET` | Secret for the hosted Web application OAuth client. |
+| `GMAIL_REFRESH_TOKEN` | Gmail `gmail.send` refresh token for the account authorized to send. |
 | `TRELLO_API_KEY` | Trello API key for card creation. |
 | `TRELLO_TOKEN` | Trello account token for card creation. |
 | `TRELLO_LIST_ID` | Trello list that receives created cards. |
@@ -166,20 +170,36 @@ with access restricted to trusted users; do not make the approval interface
 public. Community Cloud's local SQLite file is not durable storage, so request
 history may be lost when the app restarts or is redeployed.
 
-Gmail sending is **not configured for Streamlit Cloud**: the current
-integration uses a local Desktop OAuth flow and a private token file. Do not
-upload OAuth client JSON or `token.json` as repository files or expose them in
-app settings. A server-side OAuth and secure token-storage design is required
-before enabling Gmail in a hosted deployment. On a trusted local machine,
-follow the Gmail OAuth instructions below.
+For Gmail sending on Streamlit Cloud, add these values to **Settings →
+Secrets** (alongside any Groq/Trello values). Do not commit them or put them
+in source code:
+
+```toml
+GMAIL_OAUTH_CLIENT_ID = "your-web-oauth-client-id"
+GMAIL_OAUTH_CLIENT_SECRET = "your-web-oauth-client-secret"
+GMAIL_REFRESH_TOKEN = "refresh-token-for-the-authorized-gmail-account"
+```
+
+The hosted path uses Google's OAuth 2.0 refresh-token flow with a **Web
+application** client. The refresh token is exchanged server-side for a
+short-lived access token and is never displayed or written to the app
+database. If the hosted OAuth settings are partially configured, Gmail
+sending fails with a configuration message. When none are configured, the
+app retains the local token-file flow for local development; Community Cloud
+normally has no such local token file and displays the hosted setup guidance.
+Do not upload OAuth client JSON or `token.json` to the repository.
 
 ## Gmail OAuth Setup
 
-The project uses a local installed-app OAuth flow for development. The Streamlit app does not start an OAuth browser flow, and the local token-file approach is not a production deployment design.
+For local development, the project continues to use the installed-app OAuth
+flow and a private local token file. For Streamlit Cloud, use the separate
+Web application OAuth setup described above; a Desktop client and
+`token.json` are not a hosted configuration.
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), create or select a project and enable the Gmail API.
 2. Configure the Google Auth Platform consent screen. If the app is in testing mode, add the account you will authorize as a test user.
-3. Create an OAuth client ID with application type **Desktop app**.
+3. Create an OAuth client ID with application type **Desktop app** for local
+   development.
 4. Download the OAuth client JSON to a private local path. By default, the authorization command looks for `credentials.json` in the project root. Alternatively, set `GMAIL_CREDENTIALS_FILE` to the local file path in `.env`.
 5. With the project environment active and `.env` configured, run this from the project root:
 
@@ -190,7 +210,39 @@ The project uses a local installed-app OAuth flow for development. The Streamlit
 6. Complete Google's consent flow in the local browser. The command saves the authorization to `token.json` by default, or to the path in `GMAIL_TOKEN_FILE`.
 7. Start the app, submit an email request, then open **Pending Human Approvals**. Review every recipient, the subject, and the full body before selecting **Approve & Execute**.
 
-The application requests only the `gmail.send` scope. Keep both OAuth JSON files private. If authorization expires or is revoked, re-run the local authorization command. Do not deploy the desktop OAuth client or local token file to a public server.
+The local application requests only the `gmail.send` scope. Keep both OAuth
+JSON files private. If authorization expires or is revoked, re-run the local
+authorization command. Do not deploy the desktop OAuth client or local token
+file to a public server.
+
+### Streamlit Cloud Gmail Authorization
+
+1. In Google Cloud Console, enable the Gmail API and configure the OAuth
+   consent screen. Add the sending account as a test user if the app is in
+   testing mode.
+2. Create a separate OAuth client with type **Web application**. Add this
+   exact authorized redirect URI:
+   `https://developers.google.com/oauthplayground`
+3. Open [Google OAuth 2.0 Playground](https://developers.google.com/oauthplayground).
+   Open its settings, enable **Use your own OAuth credentials**, and enter the
+   Web client ID and secret. Request only
+   `https://www.googleapis.com/auth/gmail.send`, authorize the intended Gmail
+   account, and exchange the authorization code for tokens.
+4. Copy the returned refresh token directly into the private Streamlit app
+   **Settings → Secrets** as `GMAIL_REFRESH_TOKEN`, together with
+   `GMAIL_OAUTH_CLIENT_ID` and `GMAIL_OAUTH_CLIENT_SECRET`. Never paste these
+   values into chat, commit them, or add them to app code. Close the
+   Playground after setup.
+5. Restart/redeploy the Streamlit app, then authorize/test by submitting an
+   email request and explicitly approving it in **Pending Human Approvals**.
+
+If the OAuth consent screen remains in **Testing**, Google refresh tokens for
+Gmail scopes can expire after seven days; publish/verify the consent
+configuration as appropriate for your use or repeat authorization when it
+expires. Google may require verification for the Gmail scope before broad
+external use. If access is revoked or the refresh token expires, create a new
+refresh token and replace the Streamlit secret. The app reports an
+authentication error without revealing Google response details.
 
 ## How to Run the Application
 

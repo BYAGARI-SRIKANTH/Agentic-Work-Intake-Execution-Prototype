@@ -207,7 +207,11 @@ def test_gmail_service_initialization_uses_authorized_http_and_timeout(monkeypat
 
     captured = {}
     credentials = Credentials()
-    monkeypatch.setattr(gmail_service, "_load_credentials", lambda _path: credentials)
+    monkeypatch.setattr(
+        gmail_service,
+        "_load_credentials",
+        lambda _path, **_kwargs: credentials,
+    )
 
     authorized_http = object()
     http_transport = object()
@@ -249,3 +253,97 @@ def test_gmail_service_initialization_uses_authorized_http_and_timeout(monkeypat
         credentials,
         http=http_transport,
     )
+
+
+def test_web_oauth_refresh_token_authorizes_mocked_gmail_send(
+    monkeypatch,
+    tmp_path,
+):
+    from datetime import datetime, timedelta, timezone
+
+    def refresh(credentials, _request):
+        credentials.token = "short-lived-test-access-token"
+        credentials.expiry = (
+            datetime.now(timezone.utc) + timedelta(minutes=30)
+        ).replace(tzinfo=None)
+
+    monkeypatch.setattr(gmail_service.Credentials, "refresh", refresh)
+
+    class SendRequest:
+        def execute(self):
+            return {"id": "web-oauth-message-123"}
+
+    class Messages:
+        def send(self, userId, body):
+            assert userId == "me"
+            assert body["raw"]
+            return SendRequest()
+
+    class Users:
+        def messages(self):
+            return Messages()
+
+    class Service:
+        def users(self):
+            return Users()
+
+    authorized_http = object()
+    monkeypatch.setattr(
+        google_auth_httplib2,
+        "AuthorizedHttp",
+        Mock(return_value=authorized_http),
+    )
+    monkeypatch.setattr(httplib2, "Http", Mock(return_value=object()))
+    build = Mock(return_value=Service())
+    monkeypatch.setattr(gmail_service, "build", build)
+
+    result = send_email(
+        "person@example.com",
+        "Project update",
+        "Ready for review.",
+        token_file=tmp_path / "unused-local-token.json",
+        oauth_client_id="web-client-id",
+        oauth_client_secret="web-client-secret",
+        refresh_token="refresh-token-value",
+    )
+
+    assert result == {"message_id": "web-oauth-message-123"}
+    build.assert_called_once_with(
+        "gmail",
+        "v1",
+        http=authorized_http,
+        cache_discovery=False,
+    )
+
+
+def test_partial_web_oauth_configuration_fails_without_local_fallback(tmp_path):
+    with pytest.raises(IntegrationError, match="partially configured") as error:
+        gmail_service._load_credentials(
+            tmp_path / "missing-local-token.json",
+            oauth_client_id="web-client-id",
+            oauth_client_secret="",
+            refresh_token="refresh-token-value",
+        )
+
+    assert error.value.category == "authentication"
+
+
+def test_invalid_web_oauth_refresh_is_sanitized(monkeypatch, tmp_path):
+    def fail_refresh(_credentials, _request):
+        raise gmail_service.google.auth.exceptions.RefreshError(
+            "private refresh token response"
+        )
+
+    monkeypatch.setattr(gmail_service.Credentials, "refresh", fail_refresh)
+
+    with pytest.raises(IntegrationError) as error:
+        gmail_service._load_credentials(
+            tmp_path / "unused-local-token.json",
+            oauth_client_id="web-client-id",
+            oauth_client_secret="web-client-secret",
+            refresh_token="refresh-token-value",
+        )
+
+    assert error.value.category == "authentication"
+    assert "private refresh token response" not in str(error.value)
+    assert "refresh-token-value" not in str(error.value)

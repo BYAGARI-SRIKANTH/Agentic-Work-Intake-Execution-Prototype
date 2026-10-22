@@ -113,13 +113,61 @@ def _persist_refreshed_token(credentials, token_file):
         ) from exc
 
 
-def _load_credentials(token_file):
+def _load_credentials(
+    token_file,
+    *,
+    oauth_client_id=None,
+    oauth_client_secret=None,
+    refresh_token=None,
+):
+    web_oauth_values = (oauth_client_id, oauth_client_secret, refresh_token)
+    if any(web_oauth_values):
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in web_oauth_values
+        ):
+            raise IntegrationError(
+                "authentication",
+                "Gmail web OAuth is partially configured. Set "
+                "GMAIL_OAUTH_CLIENT_ID, GMAIL_OAUTH_CLIENT_SECRET, and "
+                "GMAIL_REFRESH_TOKEN in Streamlit Secrets or environment "
+                "variables.",
+            )
+
+        credentials = Credentials(
+            token=None,
+            refresh_token=refresh_token.strip(),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=oauth_client_id.strip(),
+            client_secret=oauth_client_secret.strip(),
+            scopes=[GMAIL_SEND_SCOPE],
+        )
+        try:
+            credentials.refresh(Request())
+        except (google.auth.exceptions.GoogleAuthError, OSError) as exc:
+            raise IntegrationError(
+                "authentication",
+                "Gmail authorization could not be refreshed. Check the "
+                "web OAuth client, refresh token, consent status, and Gmail "
+                "send scope.",
+            ) from exc
+        if not credentials.valid:
+            raise IntegrationError(
+                "authentication",
+                "Gmail authorization is invalid. Reauthorize the Google "
+                "account and update GMAIL_REFRESH_TOKEN.",
+            )
+        return credentials
+
     token_path = Path(token_file)
     if not token_path.is_file():
         raise IntegrationError(
             "authentication",
-            "Gmail is not authorized. For local development, configure OAuth "
-            "credentials and run `python -m integrations.gmail_auth`.",
+            "Gmail is not authorized. For Streamlit Cloud, configure "
+            "GMAIL_OAUTH_CLIENT_ID, GMAIL_OAUTH_CLIENT_SECRET, and "
+            "GMAIL_REFRESH_TOKEN in app Secrets. For local development, "
+            "configure OAuth credentials and run "
+            "`python -m integrations.gmail_auth`.",
         )
 
     try:
@@ -156,12 +204,28 @@ def _load_credentials(token_file):
     return credentials
 
 
-def send_email(recipient, subject, body, *, token_file=None, service=None):
+def send_email(
+    recipient,
+    subject,
+    body,
+    *,
+    token_file=None,
+    oauth_client_id=None,
+    oauth_client_secret=None,
+    refresh_token=None,
+    service=None,
+):
     raw_message = compose_email_message(recipient, subject, body)
 
     if service is None:
         configured_token = token_file or os.getenv("GMAIL_TOKEN_FILE", "token.json")
-        credentials = _load_credentials(configured_token)
+        credentials = _load_credentials(
+            configured_token,
+            oauth_client_id=oauth_client_id or os.getenv("GMAIL_OAUTH_CLIENT_ID"),
+            oauth_client_secret=oauth_client_secret
+            or os.getenv("GMAIL_OAUTH_CLIENT_SECRET"),
+            refresh_token=refresh_token or os.getenv("GMAIL_REFRESH_TOKEN"),
+        )
         try:
             service = build(
                 "gmail",
