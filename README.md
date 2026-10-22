@@ -297,4 +297,4 @@ The tests use mocks/test doubles for external services. They do not send real em
 ## Author and Project Links
 
 - Project repository: https://github.com/BYAGARI-SRIKANTH/Agentic-Work-Intake-Execution-Prototype
-- Live demo: not deployed.
+- Live demo: https://agentic-work-intake-execution-prototype-bscbkjzkagduk5bk2mxq4q.streamlit.app/
