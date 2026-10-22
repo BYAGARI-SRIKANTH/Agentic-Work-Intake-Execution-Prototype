@@ -2,13 +2,24 @@ import os
 import json
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-import requests
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 from dotenv import load_dotenv
 from groq import Groq
+
+from integrations.action_executor import (
+    action_fingerprint,
+    execute_approved_action,
+    reject_pending_action,
+    requires_human_approval,
+)
+from integrations.gmail_service import send_email
+from integrations.intake_routing import normalize_analysis
+from integrations.safe_web import check_public_website
+from integrations.trello_service import create_trello_card
 
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -41,16 +52,22 @@ def get_api_key():
     """Load the Groq key from Streamlit Secrets or environment variables."""
     try:
         key = st.secrets.get("GROQ_API_KEY")
-        if key:
-            return str(key).strip()
-    except Exception:
-        pass
+    except StreamlitSecretNotFoundError:
+        key = None
 
-    key = os.getenv("GROQ_API_KEY")
+    key = key or os.getenv("GROQ_API_KEY")
     if key:
         return key.strip()
 
     return ""
+
+
+def get_integration_setting(name, default=""):
+    try:
+        value = st.secrets.get(name)
+    except StreamlitSecretNotFoundError:
+        value = None
+    return str(value or os.getenv(name, default)).strip()
 
 
 def is_rate_limit_error(exc):
@@ -96,74 +113,6 @@ def call_groq(prompt):
 
     client = Groq(api_key=api_key)
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "task_title": {"type": "string"},
-            "summary": {"type": "string"},
-            "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
-            "detected_deadline": {"type": "string"},
-            "missing_information": {"type": "array", "items": {"type": "string"}},
-            "actions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "action_title": {"type": "string"},
-                        "tool_to_use": {
-                            "type": "string",
-                            "enum": ["check_website_status", "create_task_record", "draft_communication", "none"],
-                        },
-                        "routing_category": {
-                            "type": "string",
-                            "enum": ["execute_automatically", "prepare_for_human_review", "cannot_execute_with_tools", "requires_clarification"],
-                        },
-                        "reason": {"type": "string"},
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "url": {"type": "string"},
-                                "title": {"type": "string"},
-                                "deadline": {"type": "string"},
-                                "priority": {"type": "string"},
-                                "recipient": {"type": "string"},
-                                "subject": {"type": "string"},
-                                "body": {"type": "string"},
-                            },
-                            "required": [
-                                "url",
-                                "title",
-                                "deadline",
-                                "priority",
-                                "recipient",
-                                "subject",
-                                "body",
-                            ],
-                            "additionalProperties": False,
-                        },
-                    },
-                    "required": [
-                        "action_title",
-                        "tool_to_use",
-                        "routing_category",
-                        "reason",
-                        "parameters",
-                    ],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": [
-            "task_title",
-            "summary",
-            "priority",
-            "detected_deadline",
-            "missing_information",
-            "actions",
-        ],
-        "additionalProperties": False,
-    }
-
     errors = []
     models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
 
@@ -173,14 +122,7 @@ def call_groq(prompt):
                 response = client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "work_intake_analysis",
-                            "strict": True,
-                            "schema": schema,
-                        },
-                    },
+                    response_format={"type": "json_object"},
                 )
                 response_text = response.choices[0].message.content
                 if not response_text:
@@ -212,7 +154,6 @@ def call_groq(prompt):
 
     raise RuntimeError(
         "Groq could not process this request with the configured models. "
-        f"Last error: {errors[-1] if errors else 'Unknown error'}"
     )
 
 
@@ -317,6 +258,27 @@ def init_db():
         add_column_if_missing(
             conn, "actions", "updated_at", "DATETIME"
         )
+        add_column_if_missing(
+            conn, "actions", "approval_hash", "TEXT"
+        )
+        add_column_if_missing(
+            conn, "actions", "approved_at", "DATETIME"
+        )
+        add_column_if_missing(
+            conn, "actions", "executed_at", "DATETIME"
+        )
+        add_column_if_missing(
+            conn, "actions", "external_service", "TEXT"
+        )
+        add_column_if_missing(
+            conn, "actions", "external_id", "TEXT"
+        )
+        add_column_if_missing(
+            conn, "actions", "external_url", "TEXT"
+        )
+        add_column_if_missing(
+            conn, "actions", "error_summary", "TEXT"
+        )
 
         # Backfill created_at from the old timestamp column.
         conn.execute(
@@ -381,7 +343,7 @@ init_db()
 # =============================================================================
 
 def check_website_status(url):
-    """Real bounded website availability check."""
+    """Check a public HTTP(S) website while pinning DNS and validating redirects."""
     if not url:
         return json.dumps(
             {
@@ -394,40 +356,7 @@ def check_website_status(url):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    try:
-        started = time.perf_counter()
-
-        response = requests.get(
-            url,
-            timeout=8,
-            allow_redirects=True,
-            headers={
-                "User-Agent": "Altibbe-Agent-Prototype/1.0"
-            },
-        )
-
-        elapsed = round(time.perf_counter() - started, 3)
-
-        return json.dumps(
-            {
-                "url": url,
-                "final_url": response.url,
-                "status_code": response.status_code,
-                "reachable": response.status_code < 500,
-                "response_time_seconds": elapsed,
-            },
-            indent=2,
-        )
-
-    except requests.RequestException as exc:
-        return json.dumps(
-            {
-                "url": url,
-                "reachable": False,
-                "error": str(exc),
-            },
-            indent=2,
-        )
+    return json.dumps(check_public_website(url), indent=2)
 
 
 def create_task_record(title, deadline, priority):
@@ -480,7 +409,17 @@ IMPORTANT SAFETY RULES:
 - Do not claim an external email was sent.
 - Do not claim a real calendar reminder was created.
 - Only use check_website_status for a bounded website check.
-- create_task_record and draft_communication require human approval.
+- create_task_record requires human approval; draft_communication creates only
+  a local draft and does not require approval to avoid sending.
+- send_email and create_trello_card always require explicit human approval.
+- Use draft_communication only when the user wants an email prepared or shown,
+  without asking for it to be sent later.
+- If the user says not to send until they approve, or asks to send after
+  approval, use send_email and route it to prepare_for_human_review.
+- Preparing a draft alone never sends email. Sending is a separate action that
+  can happen only after the user approves the exact proposed message.
+- A local task record is not a Trello card; a communication draft is not an email.
+- Never choose execute_automatically for an email send or Trello card.
 - Keep the plan small and practical.
 
 Every action MUST use exactly one routing category:
@@ -503,9 +442,19 @@ Available tools:
 
 - check_website_status
 - create_task_record
-- draft_communication
+- draft_communication (local draft only; no sending)
+- send_email (recipient, subject, and plain-text body are required)
+- create_trello_card (title and description are required; due_date is optional)
 
-Return ONLY JSON matching the supplied schema.
+Only include the parameters needed by the selected action. Never list
+irrelevant fields as missing information. For example, email actions need only
+recipient, subject, and body; website checks need only url; Trello cards need
+title and description, with due_date optional.
+
+Return ONLY valid JSON with task_title, summary, priority, detected_deadline,
+missing_information, and actions. Each action has action_title, tool_to_use,
+routing_category, reason, and parameters. The parameters object may contain
+only fields relevant to that action.
 """
 
 
@@ -516,94 +465,6 @@ def process_intake(text):
         + text
     )
     return call_groq(prompt)
-
-
-# =============================================================================
-# VALIDATION / NORMALIZATION
-# =============================================================================
-
-VALID_CATEGORIES = {
-    "execute_automatically",
-    "prepare_for_human_review",
-    "cannot_execute_with_tools",
-    "requires_clarification",
-}
-
-VALID_TOOLS = {
-    "check_website_status",
-    "create_task_record",
-    "draft_communication",
-    "none",
-}
-
-
-def normalize_analysis(analysis):
-    """Protect the app if the model returns unexpected values."""
-    if not isinstance(analysis, dict):
-        raise ValueError("AI response is not a JSON object.")
-
-    analysis["task_title"] = str(
-        analysis.get("task_title") or "Untitled task"
-    )
-
-    analysis["summary"] = str(
-        analysis.get("summary") or ""
-    )
-
-    analysis["priority"] = str(
-        analysis.get("priority") or "Medium"
-    )
-
-    if analysis["priority"] not in {"High", "Medium", "Low"}:
-        analysis["priority"] = "Medium"
-
-    missing = analysis.get("missing_information", [])
-    if isinstance(missing, str):
-        missing = [missing]
-    if not isinstance(missing, list):
-        missing = []
-
-    analysis["missing_information"] = [
-        str(item) for item in missing
-    ]
-
-    actions = analysis.get("actions", [])
-    if not isinstance(actions, list):
-        actions = []
-
-    normalized_actions = []
-
-    for action in actions:
-        if not isinstance(action, dict):
-            continue
-
-        category = action.get("routing_category", "requires_clarification")
-        tool = action.get("tool_to_use", "none")
-
-        if category not in VALID_CATEGORIES:
-            category = "requires_clarification"
-
-        if tool not in VALID_TOOLS:
-            tool = "none"
-
-        params = action.get("parameters", {})
-        if not isinstance(params, dict):
-            params = {}
-
-        normalized_actions.append(
-            {
-                "action_title": str(
-                    action.get("action_title") or "Unnamed action"
-                ),
-                "tool_to_use": tool,
-                "routing_category": category,
-                "reason": str(action.get("reason") or ""),
-                "parameters": params,
-            }
-        )
-
-    analysis["actions"] = normalized_actions
-    return analysis
 
 
 # =============================================================================
@@ -637,10 +498,61 @@ def save_request_and_actions(raw_text, analysis):
             tool = action["tool_to_use"]
             params = action["parameters"]
 
-            if category == "execute_automatically":
+            if tool == "none":
+                category = "cannot_execute_with_tools"
+                output = "No supported action was selected."
+                status = "FLAGGED"
+                log_activity(
+                    "ROUTED_FLAGGED",
+                    f"{action['action_title']} has no supported action.",
+                    conn,
+                )
+
+            elif category == "cannot_execute_with_tools":
+                output = action["reason"] or (
+                    "This action cannot be performed with the available tools."
+                )
+                status = "FLAGGED"
+                log_activity(
+                    "ROUTED_FLAGGED",
+                    f"{action['action_title']} cannot be performed with available tools.",
+                    conn,
+                )
+
+            elif tool in {"send_email", "create_trello_card"} and category == "requires_clarification":
+                output = action["reason"] or "Required action information is missing."
+                status = "NEEDS_CLARIFICATION"
+                log_activity(
+                    "ROUTED_CLARIFICATION",
+                    f"{action['action_title']} needs clarification.",
+                    conn,
+                )
+
+            elif tool in {"send_email", "create_trello_card"} and category != "cannot_execute_with_tools":
+                category = "prepare_for_human_review"
+                output = (
+                    "External action is awaiting explicit human approval. "
+                    "No external request has been made."
+                )
+                status = "PENDING_APPROVAL"
+                log_activity(
+                    "ROUTED_HITL",
+                    f"{action['action_title']} paused for human approval.",
+                    conn,
+                )
+
+            elif category == "execute_automatically":
                 if tool == "check_website_status":
                     output = check_website_status(
                         params.get("url", "")
+                    )
+                    status = "COMPLETED"
+
+                elif tool == "draft_communication":
+                    output = draft_communication(
+                        params.get("recipient", ""),
+                        params.get("subject", ""),
+                        params.get("body", ""),
                     )
                     status = "COMPLETED"
 
@@ -656,7 +568,8 @@ def save_request_and_actions(raw_text, analysis):
                     conn,
                 )
 
-            elif category == "prepare_for_human_review":
+            elif requires_human_approval(tool, category):
+                category = "prepare_for_human_review"
                 output = (
                     "Waiting for human approval in the "
                     "Pending Human Approvals tab."
@@ -666,6 +579,18 @@ def save_request_and_actions(raw_text, analysis):
                 log_activity(
                     "ROUTED_HITL",
                     f"{action['action_title']} paused for human approval.",
+                    conn,
+                )
+
+            elif category == "requires_clarification":
+                output = (
+                    f"Additional information is required. "
+                    f"Reason: {action['reason']}"
+                )
+                status = "NEEDS_CLARIFICATION"
+                log_activity(
+                    "ROUTED_CLARIFICATION",
+                    f"{action['action_title']} needs clarification.",
                     conn,
                 )
 
@@ -732,8 +657,10 @@ def get_pending_approvals():
                 a.status,
                 a.output,
                 a.parameters,
-                a.created_at
+                a.created_at,
+                r.raw_text
             FROM actions a
+            JOIN requests r ON r.id = a.request_id
             WHERE a.status = 'PENDING_APPROVAL'
             ORDER BY a.id DESC
             """
@@ -757,104 +684,42 @@ def get_history():
         ).fetchall()
 
 
-def approve_action(action_id):
-    with get_db_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT
-                id,
-                action_title,
-                action_type,
-                parameters
-            FROM actions
-            WHERE id = ?
-              AND status = 'PENDING_APPROVAL'
-            """,
-            (action_id,),
-        ).fetchone()
-
-        if row is None:
-            return False, "Action no longer exists or was already processed."
-
-        try:
-            params = json.loads(row["parameters"] or "{}")
-        except json.JSONDecodeError:
-            params = {}
-
-        tool = row["action_type"]
-
-        if tool == "draft_communication":
-            result = draft_communication(
+def approve_action(action_id, reviewed_fingerprint):
+    return execute_approved_action(
+        action_id,
+        reviewed_fingerprint,
+        get_db_connection,
+        send_email=lambda recipient, subject, body: send_email(
+            recipient,
+            subject,
+            body,
+            token_file=get_integration_setting("GMAIL_TOKEN_FILE", "token.json"),
+        ),
+        create_trello_card=lambda title, description, due_date: create_trello_card(
+            title,
+            description,
+            due_date,
+            api_key=get_integration_setting("TRELLO_API_KEY"),
+            token=get_integration_setting("TRELLO_TOKEN"),
+            list_id=get_integration_setting("TRELLO_LIST_ID"),
+        ),
+        local_handlers={
+            "draft_communication": lambda params: draft_communication(
                 params.get("recipient", ""),
-                params.get("subject", row["action_title"]),
+                params.get("subject", ""),
                 params.get("body", ""),
-            )
-
-        elif tool == "create_task_record":
-            result = create_task_record(
-                params.get("title", row["action_title"]),
-                params.get("deadline", "Not specified"),
-                params.get("priority", "Medium"),
-            )
-
-        else:
-            result = (
-                "Approved, but no supported human-review tool "
-                "was associated with this action."
-            )
-
-        now = datetime.now().isoformat()
-
-        conn.execute(
-            """
-            UPDATE actions
-            SET status = 'APPROVED_AND_EXECUTED',
-                output = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (result, now, action_id),
-        )
-
-        log_activity(
-            "HITL_APPROVED",
-            f"Action #{action_id} approved and executed as a prototype action.",
-            conn,
-        )
-
-        conn.commit()
-
-    return True, result
+            ),
+            "create_task_record": lambda params: create_task_record(
+                params.get("title", ""),
+                params.get("deadline", ""),
+                params.get("priority", ""),
+            ),
+        },
+    )
 
 
 def reject_action(action_id):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            UPDATE actions
-            SET status = 'REJECTED',
-                output = 'Rejected by human operator.',
-                updated_at = ?
-            WHERE id = ?
-              AND status = 'PENDING_APPROVAL'
-            """,
-            (datetime.now().isoformat(), action_id),
-        )
-
-        if cursor.rowcount == 0:
-            return False
-
-        log_activity(
-            "HITL_REJECTED",
-            f"Action #{action_id} rejected by human operator.",
-            conn,
-        )
-
-        conn.commit()
-
-    return True
+    return reject_pending_action(action_id, get_db_connection)
 
 
 # =============================================================================
@@ -959,7 +824,7 @@ with tab_intake:
         else:
             log_activity(
                 "INTAKE_RECEIVED",
-                f"Text snippet: {user_text[:120]}...",
+                "A new work request was received.",
             )
 
             with st.spinner(
@@ -967,7 +832,10 @@ with tab_intake:
             ):
                 try:
                     analysis = process_intake(user_text)
-                    analysis = normalize_analysis(analysis)
+                    analysis = normalize_analysis(
+                        analysis,
+                        raw_text=user_text,
+                    )
 
                     request_id = save_request_and_actions(
                         user_text,
@@ -1028,24 +896,47 @@ with tab_intake:
                                 f"Tool: `{action['tool_to_use']}` | "
                                 f"Route: `{category}`"
                             )
+                            if action["tool_to_use"] in {
+                                "draft_communication",
+                                "send_email",
+                            }:
+                                email = action["parameters"]
+                                st.markdown("**Proposed email:**")
+                                st.write(
+                                    f"**Recipient:** {email.get('recipient', '')}"
+                                )
+                                st.write(
+                                    f"**Subject:** {email.get('subject', '')}"
+                                )
+                                st.text_area(
+                                    "Plain-text body",
+                                    value=email.get("body", ""),
+                                    height=140,
+                                    disabled=True,
+                                    key=f"intake_email_body_{request_id}_{index}",
+                                )
+                                if action["tool_to_use"] == "draft_communication":
+                                    st.caption(
+                                        "Local draft only; no email was sent."
+                                    )
+                                else:
+                                    st.caption(
+                                        "Gmail will only send this after explicit approval."
+                                    )
 
                     with st.expander("View complete structured JSON"):
                         st.json(analysis)
 
                 except Exception as exc:
-                    error_text = str(exc)
-
                     log_activity(
                         "FAILURE_PATH",
-                        f"Error encountered: {error_text}",
+                        f"Request processing failed ({type(exc).__name__}).",
                     )
 
                     st.error(
-                        "Execution failed. The application did NOT "
-                        "pretend that the work succeeded."
+                        "The request could not be processed. No success "
+                        "was recorded; check the application configuration."
                     )
-
-                    st.code(error_text)
 
                     if is_rate_limit_error(exc):
                         st.warning(
@@ -1089,16 +980,57 @@ with tab_pending:
                 st.write(
                     f"**Created:** {action['created_at']}"
                 )
+                st.markdown("**Original work request:**")
+                st.write(action["raw_text"])
 
+                parameters_valid = True
                 try:
                     params = json.loads(
                         action["parameters"] or "{}"
                     )
-                except json.JSONDecodeError:
+                    if not isinstance(params, dict):
+                        raise ValueError("Action parameters must be an object.")
+                except (json.JSONDecodeError, ValueError):
                     params = {}
+                    parameters_valid = False
+                    st.error("The saved action parameters are invalid; it cannot be approved.")
 
-                st.markdown("**Proposed parameters:**")
-                st.json(params)
+                action_type = action["action_type"]
+                if parameters_valid and action_type == "send_email":
+                    st.markdown("**Email to be sent (review these exact details):**")
+                    st.write(f"**Recipients:** {params.get('recipient', '')}")
+                    st.write(f"**Subject:** {params.get('subject', '')}")
+                    st.text_area(
+                        "Plain-text body",
+                        value=params.get("body", ""),
+                        height=180,
+                        disabled=True,
+                        key=f"review_email_body_{action_id}",
+                    )
+                elif parameters_valid and action_type == "create_trello_card":
+                    st.markdown("**Trello card to be created (review these exact details):**")
+                    st.write(f"**Title:** {params.get('title', '')}")
+                    st.text_area(
+                        "Description",
+                        value=params.get("description", ""),
+                        height=150,
+                        disabled=True,
+                        key=f"review_trello_description_{action_id}",
+                    )
+                    if params.get("due_date"):
+                        st.write(f"**Due:** {params['due_date']}")
+                elif parameters_valid:
+                    st.markdown("**Proposed local action parameters:**")
+                    st.json(params)
+
+                try:
+                    reviewed_fingerprint = action_fingerprint(
+                        action_id,
+                        action_type,
+                        params,
+                    )
+                except (TypeError, ValueError):
+                    reviewed_fingerprint = None
 
                 st.markdown("**Current status:**")
                 st.info(action["status"])
@@ -1110,17 +1042,54 @@ with tab_pending:
                         "✅ Approve & Execute",
                         key=f"approve_{action_id}",
                         use_container_width=True,
+                        disabled=not parameters_valid or reviewed_fingerprint is None,
                     ):
-                        ok, result = approve_action(action_id)
+                        ok, result = approve_action(
+                            action_id,
+                            reviewed_fingerprint,
+                        )
+                        try:
+                            result_data = json.loads(result)
+                        except (json.JSONDecodeError, TypeError):
+                            result_data = {"message": result}
+                        if not isinstance(result_data, dict):
+                            result_data = {"message": result_data}
 
                         if ok:
-                            st.success(
-                                "Action approved and executed."
-                            )
-                            st.json(json.loads(result))
-                            st.rerun()
+                            if action_type == "send_email":
+                                st.success("Gmail confirmed the email submission.")
+                                st.write(
+                                    f"**Gmail message ID:** "
+                                    f"`{result_data['message_id']}`"
+                                )
+                            elif action_type == "create_trello_card":
+                                st.success("Trello confirmed card creation.")
+                                st.markdown(
+                                    f"[Open Trello card]({result_data['card_url']})"
+                                )
+                                st.write(
+                                    f"**Trello card ID:** `{result_data['card_id']}`"
+                                )
+                            else:
+                                st.success(
+                                    "Local action completed. No external service was contacted."
+                                )
+                                st.json(result_data)
                         else:
-                            st.error(result)
+                            status = result_data.get("status")
+                            if status == "OUTCOME_UNKNOWN":
+                                st.warning(
+                                    "The external service may have performed this action, "
+                                    "but did not confirm it. Check the service manually; "
+                                    "this action will not be retried automatically."
+                                )
+                                st.error(result_data.get("error", "Outcome unknown."))
+                            elif status == "FAILED":
+                                st.error(
+                                    result_data.get("error", "The action failed.")
+                                )
+                            else:
+                                st.error(result_data.get("message", result))
 
                 with col2:
                     if st.button(
@@ -1132,7 +1101,6 @@ with tab_pending:
                             st.warning(
                                 "Action rejected by human operator."
                             )
-                            st.rerun()
                         else:
                             st.error(
                                 "Action could not be rejected."
@@ -1182,6 +1150,10 @@ with tab_history:
                             reason,
                             status,
                             output,
+                            external_service,
+                            external_id,
+                            external_url,
+                            error_summary,
                             created_at,
                             updated_at
                         FROM actions
@@ -1209,6 +1181,17 @@ with tab_history:
                                 action["output"],
                                 language="json",
                             )
+                        if action["external_id"]:
+                            st.write(
+                                f"**Confirmed {action['external_service']} ID:** "
+                                f"`{action['external_id']}`"
+                            )
+                        if action["external_url"]:
+                            st.markdown(
+                                f"[Open external action]({action['external_url']})"
+                            )
+                        if action["error_summary"]:
+                            st.warning(action["error_summary"])
 
                         st.divider()
                 else:
